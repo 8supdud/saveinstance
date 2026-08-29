@@ -312,6 +312,424 @@ local function cframeToQuaternion(cframe)
 	return qX, qY, qZ, qW
 end
 
+-- ============================================================================
+-- NEW: Multiple Decompiler Fallbacks
+-- ============================================================================
+
+local function GetBase64Encoder()
+    if syn and syn.crypt and syn.crypt.base64 and syn.crypt.base64.encode then
+        return syn.crypt.base64.encode
+    elseif crypt and crypt.base64encode then
+        return crypt.base64encode
+    elseif base64encode then
+        return base64encode
+    end
+    -- Fallback pure Lua
+    local b = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+    return function(data)
+        return ((data:gsub('.', function(x)
+            local r,byte = '',x:byte()
+            for i=8,1,-1 do r = r .. (byte % 2^i - byte % 2^(i-1) > 0 and '1' or '0') end
+            return r
+        end)..'0000'):gsub('%d%d%d?%d?%d?%d?', function(x)
+            if #x < 6 then return '' end
+            local c = 0
+            for i=1,6 do c = c + (x:sub(i,i) == '1' and 2^(6-i) or 0) end
+            return b:sub(c+1,c+1)
+        end)..({ '', '==', '=' })[#data % 3 + 1])
+    end
+end
+
+local function DecompileWithFallback(script, options)
+    -- Try built-in decompiler first
+    if typeof(decompile) == "function" and not options.PreferFallback then
+        local ok, result = pcall(decompile, script)
+        if ok and result and result ~= "" then
+            return result
+        end
+    end
+    
+    -- Fallback: use external decompilers
+    if getscriptbytecode then
+        local ok, bytecode = pcall(getscriptbytecode, script)
+        if ok and bytecode and bytecode ~= "" then
+            local base64Encode = GetBase64Encoder()
+            local request = syn and syn.request or http and http.request or http_request or request
+            local fallbackMode = options.DecompilerFallback or "Konstant"
+            local encoded = base64Encode(bytecode)
+            
+            if fallbackMode == "Konstant" then
+                local res = request({
+                    Url = "http://api.plusgiant5.com/konstant/decompile",
+                    Method = "POST",
+                    Body = bytecode,
+                    Headers = {["Content-Type"] = "text/plain"}
+                })
+                if res and res.StatusCode == 200 and res.Body then
+                    return res.Body
+                end
+            elseif fallbackMode == "Sabre" then
+                local res = request({
+                    Url = "https://www.decompiler.lol/api/decompile",
+                    Method = "POST",
+                    Headers = {["Content-Type"] = "application/json"},
+                    Body = service.HttpService:JSONEncode({
+                        target = "luau",
+                        mode = "decompile",
+                        bytecodeBase64 = encoded
+                    })
+                })
+                if res and res.StatusCode == 200 and res.Body then
+                    local parsed = service.HttpService:JSONDecode(res.Body)
+                    if parsed and parsed.ok and parsed.output then
+                        return parsed.output
+                    end
+                end
+            elseif fallbackMode == "x2125" then
+                local res = request({
+                    Url = "https://x2125.xyz/decompile",
+                    Method = "POST",
+                    Headers = {["Content-Type"] = "application/json"},
+                    Body = service.HttpService:JSONEncode({
+                        script = encoded,
+                        options = {renamingType = "INFER", upvalueComment = true, lineDefinedComment = true}
+                    })
+                })
+                if res and res.StatusCode == 200 and res.Body then
+                    local parsed = service.HttpService:JSONDecode(res.Body)
+                    if parsed and parsed.data then
+                        return parsed.data
+                    end
+                end
+            elseif fallbackMode == "Bytefall" then
+                local res = request({
+                    Url = "https://beta.bytefall.dev/decompile",
+                    Method = "POST",
+                    Headers = {["Content-Type"] = "application/json"},
+                    Body = service.HttpService:JSONEncode({ script = encoded })
+                })
+                if res and res.StatusCode == 200 and res.Body then
+                    return res.Body
+                end
+            end
+        end
+    end
+    
+    return "-- Failed to decompile script"
+end
+
+-- ============================================================================
+-- NEW: Script Caching to Disk
+-- ============================================================================
+
+local function LoadScriptCache()
+    if not isfile then return {} end
+    local ok, data = pcall(readfile, "ScriptCache.json")
+    if ok and data and data ~= "" then
+        local decoded = pcall(service.HttpService.JSONDecode, service.HttpService, data)
+        if decoded then return decoded end
+    end
+    return {}
+end
+
+local function SaveScriptCache(cache)
+    if not writefile then return end
+    pcall(writefile, "ScriptCache.json", service.HttpService:JSONEncode(cache))
+end
+
+-- ============================================================================
+-- NEW: LinkedSource Recovery
+-- ============================================================================
+
+local function RecoverLinkedSource(script, options)
+    local linkedSource
+    local o, linkedSourceUrl = pcall(index, script, "LinkedSource")
+    if not o or linkedSourceUrl == "" then
+        return nil
+    end
+    
+    linkedSource = string.match(linkedSourceUrl, "%w+$")
+    if not linkedSource then
+        return nil
+    end
+    
+    -- Check cache first
+    if options.SaveScriptCache and ldeccache then
+        local cached = ldeccache[linkedSource]
+        if cached then
+            return cached
+        end
+    end
+    
+    local sourceType = string.find(linkedSource, "%a") and "hash" or "id"
+    local asset = sourceType .. "=" .. linkedSource
+    
+    local ok, source = pcall(function()
+        return game:HttpGet("https://assetdelivery.roproxy.com/v1/asset/?" .. asset, true)
+    end)
+    
+    if ok and source and source ~= "" then
+        -- Cache it
+        if options.SaveScriptCache and ldeccache then
+            ldeccache[linkedSource] = source
+        end
+        return source
+    end
+    
+    return nil
+end
+
+-- ============================================================================
+-- NEW: Parallel Decompilation with Thread Pool
+-- ============================================================================
+
+local function DecompileParallel(scripts, options)
+    if not options.Decompile then return {} end
+    
+    local sources = {}
+    local scriptQueue = {}
+    for _, scr in scripts do
+        table.insert(scriptQueue, scr)
+    end
+    
+    local left = #scriptQueue
+    local maxThreads = options.MaxThreads or 3
+    local scriptCache = options.SaveScriptCache and ldeccache
+    
+    -- Load existing cache
+    local diskCache = {}
+    if options.SaveScriptCache then
+        diskCache = LoadScriptCache()
+        -- Merge with memory cache
+        for k, v in diskCache do
+            if not scriptCache[k] then
+                scriptCache[k] = v
+            end
+        end
+    end
+    
+    -- Status tracking
+    local completed = 0
+    local total = #scriptQueue
+    
+    for i = 1, math.min(maxThreads, #scriptQueue) do
+        task.spawn(function()
+            while true do
+                local script = table.remove(scriptQueue)
+                if not script then break end
+                
+                local source = nil
+                local bytecode = nil
+                
+                -- Try to get bytecode for caching
+                if getscriptbytecode then
+                    local ok, bc = pcall(getscriptbytecode, script)
+                    if ok and bc and bc ~= "" then
+                        bytecode = bc
+                        -- Check memory cache first
+                        if scriptCache and scriptCache[bytecode] then
+                            source = scriptCache[bytecode]
+                        end
+                    end
+                end
+                
+                -- If not cached, try LinkedSource recovery first
+                if not source then
+                    source = RecoverLinkedSource(script, options)
+                end
+                
+                -- If still no source, decompile
+                if not source then
+                    source = DecompileWithFallback(script, options)
+                end
+                
+                -- Cache the result
+                if source and bytecode and scriptCache then
+                    scriptCache[bytecode] = source
+                end
+                
+                sources[script] = source or "-- Script could not be decompiled or recovered"
+                
+                completed = completed + 1
+                left = left - 1
+                
+                -- Update status periodically
+                if StatusText and total > 0 then
+                    StatusText.Text = string.format("Decompiling scripts... (%d/%d)", completed, total)
+                end
+            end
+        end)
+    end
+    
+    -- Wait for all to finish with timeout
+    local timeout = options.DecompileTimeout * 2 + 10
+    local start = os.clock()
+    while left > 0 and os.clock() - start < timeout do
+        task.wait(0.1)
+    end
+    
+    -- Save cache to disk
+    if options.SaveScriptCache and scriptCache then
+        SaveScriptCache(scriptCache)
+    end
+    
+    return sources
+end
+
+-- ============================================================================
+-- NEW: Anonymous Mode
+-- ============================================================================
+
+local function CleanAnonymousData(root, options)
+    if not options.Anonymous then return end
+
+    local Players = service.Players
+    local LocalPlayer = Players.LocalPlayer
+    if not LocalPlayer then return end
+
+    local UserIdStr = tostring(LocalPlayer.UserId)
+    local PlayerName = LocalPlayer.Name
+    local DisplayName = LocalPlayer.DisplayName
+
+    local AnonConfig = typeof(options.Anonymous) == "table" and options.Anonymous or {
+        UserId = "1",
+        Name = "Roblox"
+    }
+
+    local AnonUserId = tostring(AnonConfig.UserId)
+    local AnonName = AnonConfig.Name
+
+    local function GsubCaseInsensitive(input, search, replacement)
+        local inputLower = string.lower(input)
+        search = string.lower(search)
+        if not string.find(inputLower, search, 1, true) then return input end
+        local lastFinish = 0
+        local subStrings = {}
+        local search_len = #search
+        local input_len = #input
+        while search_len <= input_len - lastFinish do
+            local init = lastFinish + 1
+            local start, finish = string.find(inputLower, search, init, true)
+            if start == nil then break end
+            table.insert(subStrings, string.sub(input, init, start - 1))
+            lastFinish = finish
+        end
+        if lastFinish == 0 then return input end
+        table.insert(subStrings, string.sub(input, lastFinish + 1))
+        return table.concat(subStrings, replacement)
+    end
+
+    local function ScrubValue(val)
+        if type(val) == "string" then
+            val = GsubCaseInsensitive(val, PlayerName, AnonName)
+            if DisplayName then val = GsubCaseInsensitive(val, DisplayName, AnonName) end
+            val = string.gsub(val, UserIdStr, AnonUserId)
+            return val
+        elseif type(val) == "number" and tostring(val) == UserIdStr then
+            return tonumber(AnonUserId) or 1
+        end
+        return val
+    end
+
+    local function Process(inst)
+        pcall(function()
+            local OldName = inst.Name
+            local NewName = ScrubValue(OldName)
+            if NewName ~= OldName then inst.Name = NewName end
+        end)
+
+        if inst:IsA("StringValue") then
+            pcall(function() inst.Value = ScrubValue(inst.Value) end)
+        elseif inst:IsA("IntValue") or inst:IsA("NumberValue") then
+            pcall(function()
+                if tostring(inst.Value) == UserIdStr then
+                    inst.Value = tonumber(AnonUserId) or 1
+                end
+            end)
+        elseif inst:IsA("TextLabel") or inst:IsA("TextBox") or inst:IsA("TextButton") then
+            pcall(function() inst.Text = ScrubValue(inst.Text) end)
+        end
+
+        pcall(function()
+            for AttrName, AttrVal in inst:GetAttributes() do
+                local NewVal = ScrubValue(AttrVal)
+                if NewVal ~= AttrVal then inst:SetAttribute(AttrName, NewVal) end
+            end
+        end)
+        
+        for _, child in inst:GetChildren() do
+            Process(child)
+        end
+    end
+
+    if root == game then
+        for _, serviceObj in game:GetChildren() do
+            local className = serviceObj.ClassName
+            if className ~= "CoreGui" and className ~= "CorePackages" then
+                Process(serviceObj)
+            end
+        end
+    else
+        local isTable = type(root) == "table"
+        if isTable then
+            for _, inst in root do
+                Process(inst)
+            end
+        else
+            Process(root)
+        end
+    end
+end
+
+-- ============================================================================
+-- NEW: Safety Features
+-- ============================================================================
+
+local antiAfkCon = nil
+
+local function ActivateSafeMode()
+    pcall(function() service.Players.LocalPlayer:Kick("SaveInstance SafeMode: Saving initiated. Goodbye!") end)
+    if getreg then
+        for _, v in next, getreg() do
+            if type(v) == 'thread' then
+                pcall(function() task.cancel(v) end)
+            end
+        end
+    end
+end
+
+local function BoostFPS()
+    pcall(function()
+        if UserSettings and UserSettings().GameSettings then
+            UserSettings().GameSettings.FPSUnlocked = false
+            UserSettings().GameSettings.MasterVolume = 0
+        end
+        service.RunService:Set3dRenderingEnabled(false)
+    end)
+    if workspace.CurrentCamera then
+        workspace.CurrentCamera.MaxAxisOfRotation = 0
+    end
+end
+
+local function AntiIdle()
+    if getconnections then
+        for _, c in getconnections(service.Players.LocalPlayer.Idled) do
+            pcall(function() c:Disable() end)
+            pcall(function() c:Disconnect() end)
+        end
+    end
+
+    if antiAfkCon then
+        antiAfkCon:Disconnect()
+        antiAfkCon = nil
+    end
+    
+    antiAfkCon = service.Players.LocalPlayer.Idled:Connect(function()
+        service.VirtualUser:CaptureController()
+        service.VirtualUser:ClickButton2(Vector2.zero)
+    end)
+end
+
 local function classifyTable(t)
 	local len = #t
 	if len > 0 then
@@ -1947,7 +2365,7 @@ do
 					table.insert(blob, {
 						AssetId = acc.AssetId,
 						Order = acc.Order,
-						AccessoryType = acc.AccessoryType.Name,
+							AccessoryType = acc.AccessoryType.Name,
 						Puffiness = acc.Puffiness,
 					})
 				end
@@ -2658,6 +3076,14 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 			RemovePlayers = "IsolatePlayers",
 			RemovePlayerCharacters = "SavePlayerCharacters",
 		},
+		
+		-- NEW OPTIONS FROM DEXRE
+		Binary = false,
+		Clipboard = false,
+		MaxThreads = 3,
+		DecompilerFallback = "Konstant",
+		PreferFallback = false,
+		SaveScriptCache = false,
 	}
 	local OPTIONS_lowercase, OptionsAliasesInverse_lowercase, CustomOptions_valid = {}, {}, {}
 
@@ -2779,6 +3205,28 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 		else
 			CustomOptions = {}
 		end
+	end
+
+	-- ============================================================
+	-- Apply DexRE features after OPTIONS merging
+	-- ============================================================
+	
+	if OPTIONS.Anonymous then
+		CleanAnonymousData(ToSaveInstance or game, OPTIONS)
+	end
+	
+	if OPTIONS.SafeMode then
+		ActivateSafeMode()
+		OPTIONS.BoostFPS = true
+		OPTIONS.KillAllScripts = true
+	end
+	
+	if OPTIONS.BoostFPS then
+		BoostFPS()
+	end
+	
+	if OPTIONS.AntiIdle then
+		AntiIdle()
 	end
 
 	if not writefile and not OPTIONS.Callback then
@@ -3243,67 +3691,20 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 		end
 	end
 
+	-- ============================================================
+	-- NEW: Use Parallel Decompilation with Thread Pool
+	-- ============================================================
+	
 	do
 		if not OPTIONS.Decompile then
-			ldecompile = function()
+			ldecompile = function(script)
 				return "-- Decompiling is disabled"
 			end
-		elseif decompile then
-			local decomp = makeTimeoutHandler(OPTIONS.DecompileTimeout, decompile, "Decompiler timed out")
-
-			ldecompile = function(script)
-				local bytecode
-				if ScriptCache then
-					local s
-					s, bytecode = getbytecode(script)
-					local cached
-
-					if s then
-						if not bytecode or bytecode == "" then
-							return "-- The Script is Empty"
-						end
-						cached = ldeccache[bytecode]
-					else
-						bytecode = nil
-					end
-
-					if cached then
-						if __DEBUG_MODE then
-							__DEBUG_MODE("Found in Cache", script:GetFullName())
-						end
-						return cached
-					end
-				else
-					if DecompileJobless then
-						return "-- Not found in already decompiled ScriptCache"
-					end
-				end
-
-				local ok, result = run_with_loading("Decompiling " .. script.Name, true, nil, decomp, script)
-				if not result then
-					ok, result = false, "Empty Output"
-				end
-
-				local output
-				if ok then
-					result = string.gsub(result, "\0", "\\0")
-					output = result
-				else
-					output = "--[[ Failed to decompile. Reason:\n" .. (result or "") .. "\n]]"
-				end
-
-				if ScriptCache and bytecode then
-					ldeccache[bytecode] = output
-					if __DEBUG_MODE then
-						__DEBUG_MODE("Cached", script:GetFullName())
-					end
-				end
-
-				return output
-			end
 		else
-			ldecompile = function()
-				return "-- Your Executor does NOT have a Decompiler"
+			-- Use the parallel decompiler with fallback
+			ldecompile = function(script)
+				-- For single script, use fallback directly
+				return DecompileWithFallback(script, OPTIONS)
 			end
 		end
 	end
@@ -3549,7 +3950,35 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 		return Item
 	end
 
+	-- ============================================================
+	-- MODIFIED: save_hierarchy with parallel decompilation support
+	-- ============================================================
+	
 	local function save_hierarchy(hierarchy)
+		-- Collect all scripts for parallel decompilation
+		local scriptsToDecompile = {}
+		local scriptSourceCache = {}
+		
+		-- First pass: collect scripts
+		local function collectScripts(instances)
+			for _, instance in instances do
+				if isLuaSourceContainer(instance) then
+					table.insert(scriptsToDecompile, instance)
+				end
+				local children = instance:GetChildren()
+				if #children > 0 then
+					collectScripts(children)
+				end
+			end
+		end
+		collectScripts(hierarchy)
+		
+		-- Decompile scripts in parallel
+		if #scriptsToDecompile > 0 and OPTIONS.Decompile then
+			scriptSourceCache = DecompileParallel(scriptsToDecompile, OPTIONS)
+		end
+		
+		-- Second pass: save with cached sources
 		for _, instance in hierarchy do
 			local InstanceOverride, ClassTagOverride, ClassNameOverride
 
@@ -3854,7 +4283,8 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 											then
 												value = "-- [FilteringEnabled] Server Scripts are IMPOSSIBLE to save"
 											else
-												value = ldecompile(instance)
+												-- Use cached source if available
+												value = scriptSourceCache[instance] or ldecompile(instance)
 												if SaveBytecode then
 													local output = SaveBytecode(instance)
 													if output then
@@ -4189,6 +4619,10 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 			connection:Disconnect()
 		end
 		GLOBAL_ENV[placename] = nil
+		-- Cleanup anti-idle
+		if antiAfkCon then
+			pcall(function() antiAfkCon:Disconnect() end)
+		end
 	end
 	do
 		local Players = service.Players
