@@ -730,6 +730,10 @@ local function AntiIdle()
     end)
 end
 
+-- ============================================================================
+-- NEW: Binary Format Support (ADDED FROM DEXRE)
+-- ============================================================================
+
 local function classifyTable(t)
 	local len = #t
 	if len > 0 then
@@ -758,6 +762,553 @@ local function resolveTypeName(value)
 	end
 	return t
 end
+
+-- Binary Writer Class
+local BinaryWriter = {}
+BinaryWriter.__index = BinaryWriter
+
+function BinaryWriter.new(InitialCapacity)
+	local Self = setmetatable({}, BinaryWriter)
+	Self.Capacity = InitialCapacity or 1024
+	Self.Buffer = buffer.create(Self.Capacity)
+	Self.Offset = 0
+	return Self
+end
+
+function BinaryWriter.EnsureCapacity(Self, SizeNeeded)
+	local Needed = Self.Offset + SizeNeeded
+	if Needed > Self.Capacity then
+		local NewCapacity = Self.Capacity * 2
+		if Needed > NewCapacity then
+			NewCapacity = Needed * 2
+		end
+		local NewBuffer = buffer.create(NewCapacity)
+		buffer.copy(NewBuffer, 0, Self.Buffer, 0, Self.Offset)
+		Self.Buffer = NewBuffer
+		Self.Capacity = NewCapacity
+	end
+end
+
+function BinaryWriter.WriteUInt8(Self, Value)
+	Self:EnsureCapacity(1)
+	buffer.writeu8(Self.Buffer, Self.Offset, Value)
+	Self.Offset = Self.Offset + 1
+end
+
+function BinaryWriter.WriteUInt32LE(Self, Value)
+	Self:EnsureCapacity(4)
+	buffer.writeu32(Self.Buffer, Self.Offset, Value)
+	Self.Offset = Self.Offset + 4
+end
+
+function BinaryWriter.WriteInt32LE(Self, Value)
+	Self:EnsureCapacity(4)
+	buffer.writei32(Self.Buffer, Self.Offset, Value)
+	Self.Offset = Self.Offset + 4
+end
+
+function BinaryWriter.WriteFloat32LE(Self, Value)
+	Self:EnsureCapacity(4)
+	buffer.writef32(Self.Buffer, Self.Offset, Value)
+	Self.Offset = Self.Offset + 4
+end
+
+function BinaryWriter.WriteFloat64LE(Self, Value)
+	Self:EnsureCapacity(8)
+	buffer.writef64(Self.Buffer, Self.Offset, Value)
+	Self.Offset = Self.Offset + 8
+end
+
+function BinaryWriter.WriteString(Self, Value)
+	local Length = #Value
+	Self:EnsureCapacity(Length)
+	buffer.writestring(Self.Buffer, Self.Offset, Value, Length)
+	Self.Offset = Self.Offset + Length
+end
+
+function BinaryWriter.WriteSizedStringLE(Self, Value)
+	local Length = #Value
+	Self:WriteUInt32LE(Length)
+	Self:WriteString(Value)
+end
+
+function BinaryWriter.ToBuffer(Self)
+	return buffer.tostring(Self.Buffer, 0, Self.Offset)
+end
+
+-- Binary Data Type Handlers
+local binaryDataTypes = {
+	["string"] = "\1",
+	["ContentId"] = "\1",
+	["BinaryString"] = "\1",
+	["bool"] = "\2",
+	["int"] = "\3",
+	["float"] = "\4",
+	["double"] = "\5",
+	["UDim"] = "\6",
+	["UDim2"] = "\7",
+	["Ray"] = "\8",
+	["Faces"] = "\9",
+	["Axes"] = "\10",
+	["BrickColor"] = "\11",
+	["Color3"] = "\12",
+	["Vector2"] = "\13",
+	["Vector3"] = "\14",
+	["CFrame"] = "\16",
+	["Enum"] = "\18",
+	["Referent"] = "\19",
+	["Vector3int16"] = "\20",
+	["NumberSequence"] = "\21",
+	["ColorSequence"] = "\22",
+	["NumberRange"] = "\23",
+	["Rect"] = "\24",
+	["PhysicalProperties"] = "\25",
+	["Color3uint8"] = "\26",
+	["int64"] = "\27",
+	["SharedString"] = "\28",
+	["OptionalCoordinateFrame"] = "\30",
+	["Font"] = "\32"
+}
+
+local binaryCFrameMap = {
+	["\0\0\128\63\0\0\0\0\0\0\0\0\0\0\0\0\0\0\128\63\0\0\0\0\0\0\0\0\0\0\0\0\0\0\128\63"] = "\2",
+	["\0\0\128\63\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\128\191\0\0\0\0\0\0\128\63\0\0\0\0"] = "\3",
+	["\0\0\128\63\0\0\0\0\0\0\0\0\0\0\0\0\0\0\128\191\0\0\0\0\0\0\0\0\0\0\0\0\0\0\128\191"] = "\5",
+	["\0\0\128\63\0\0\0\0\0\0\0\128\0\0\0\0\0\0\0\0\0\0\128\63\0\0\0\0\0\0\128\191\0\0\0\0"] = "\6",
+	["\0\0\0\0\0\0\128\63\0\0\0\0\0\0\128\63\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\128\191"] = "\7",
+	["\0\0\0\0\0\0\0\0\0\0\128\63\0\0\128\63\0\0\0\0\0\0\0\0\0\0\0\0\0\0\128\63\0\0\0\0"] = "\9",
+	["\0\0\0\0\0\0\128\191\0\0\0\0\0\0\128\63\0\0\0\0\0\0\0\128\0\0\0\0\0\0\0\0\0\0\128\63"] = "\10",
+	["\0\0\0\0\0\0\0\0\0\0\128\191\0\0\128\63\0\0\0\0\0\0\0\0\0\0\0\0\0\0\128\191\0\0\0\0"] = "\12",
+	["\0\0\0\0\0\0\128\63\0\0\0\0\0\0\0\0\0\0\0\0\0\0\128\63\0\0\128\63\0\0\0\0\0\0\0\0"] = "\13",
+	["\0\0\0\0\0\0\0\0\0\0\128\191\0\0\0\0\0\0\128\63\0\0\0\0\0\0\128\63\0\0\0\0\0\0\0\0"] = "\14",
+	["\0\0\0\0\0\0\128\191\0\0\0\0\0\0\0\0\0\0\0\0\0\0\128\191\0\0\128\63\0\0\0\0\0\0\0\0"] = "\16",
+	["\0\0\0\0\0\0\0\0\0\0\128\63\0\0\0\0\0\0\128\191\0\0\0\0\0\0\128\63\0\0\0\0\0\0\0\128"] = "\17",
+	["\0\0\128\191\0\0\0\0\0\0\0\0\0\0\0\0\0\0\128\63\0\0\0\0\0\0\0\0\0\0\0\0\0\0\128\191"] = "\20",
+	["\0\0\128\191\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\128\63\0\0\0\0\0\0\128\63\0\0\0\128"] = "\21",
+	["\0\0\128\191\0\0\0\0\0\0\0\0\0\0\0\0\0\0\128\191\0\0\0\0\0\0\0\0\0\0\0\0\0\0\128\63"] = "\23",
+	["\0\0\128\191\0\0\0\0\0\0\0\128\0\0\0\0\0\0\0\0\0\0\128\191\0\0\0\0\0\0\128\191\0\0\0\128"] = "\24",
+	["\0\0\0\0\0\0\128\63\0\0\0\128\0\0\128\191\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\128\63"] = "\25",
+	["\0\0\0\0\0\0\0\0\0\0\128\191\0\0\128\191\0\0\0\0\0\0\0\0\0\0\0\0\0\0\128\63\0\0\0\0"] = "\27",
+	["\0\0\0\0\0\0\128\191\0\0\0\128\0\0\128\191\0\0\0\0\0\0\0\128\0\0\0\0\0\0\0\0\0\0\128\191"] = "\28",
+	["\0\0\0\0\0\0\0\0\0\0\128\63\0\0\128\191\0\0\0\0\0\0\0\0\0\0\0\0\0\0\128\191\0\0\0\0"] = "\30",
+	["\0\0\0\0\0\0\128\63\0\0\0\0\0\0\0\0\0\0\0\0\0\0\128\191\0\0\128\191\0\0\0\0\0\0\0\0"] = "\31",
+	["\0\0\0\0\0\0\0\0\0\0\128\63\0\0\0\0\0\0\128\63\0\0\0\128\0\0\128\191\0\0\0\0\0\0\0\0"] = "\32",
+	["\0\0\0\0\0\0\128\191\0\0\0\0\0\0\0\0\0\0\0\0\0\0\128\63\0\0\128\191\0\0\0\0\0\0\0\0"] = "\34",
+	["\0\0\0\0\0\0\0\0\0\0\128\191\0\0\0\0\0\0\128\191\0\0\0\128\0\0\128\191\0\0\0\0\0\0\0\128"] = "\35",
+}
+
+local function CreateChunk(TypeId, Data)
+	local Compressed = Data
+	local lz4compress = syn and syn.crypt and syn.crypt.lz4 and syn.crypt.lz4.compress or lz4compress
+	if lz4compress then
+		local compressed = lz4compress(Data)
+		if compressed and #compressed < #Data then
+			Compressed = compressed
+		end
+	end
+	
+	local HeaderBuf = buffer.create(16)
+	buffer.writestring(HeaderBuf, 0, TypeId, 4)
+	buffer.writeu32(HeaderBuf, 4, #Compressed)
+	buffer.writeu32(HeaderBuf, 8, #Data)
+	buffer.writeu32(HeaderBuf, 12, 0)
+	
+	return buffer.tostring(HeaderBuf) .. Compressed
+end
+
+-- Binary Property Handlers
+local binaryPropHandlers = {
+	["string"] = function(objs, name, func)
+		local szObjs = #objs
+		local writer = BinaryWriter.new()
+		local reader = func or (function(obj, n) return obj[n] end)
+		for i = 1, szObjs do
+			local val = reader(objs[i], name) or ""
+			writer:WriteSizedStringLE(val)
+		end
+		return writer:ToBuffer()
+	end,
+	["bool"] = function(objs, name, func)
+		local szObjs = #objs
+		local writer = BinaryWriter.new(szObjs)
+		local reader = func or (function(obj, n) return obj[n] end)
+		for i = 1, szObjs do
+			writer:WriteUInt8(reader(objs[i], name) and 1 or 0)
+		end
+		return writer:ToBuffer()
+	end,
+	["int"] = function(objs, name, func)
+		local szObjs = #objs
+		local writer = BinaryWriter.new(4 * szObjs)
+		local reader = func or (function(obj, n) return obj[n] end)
+		for i = 1, szObjs do
+			writer:WriteInt32LE(reader(objs[i], name) or 0)
+		end
+		return writer:ToBuffer()
+	end,
+	["float"] = function(objs, name, func)
+		local szObjs = #objs
+		local writer = BinaryWriter.new(4 * szObjs)
+		local reader = func or (function(obj, n) return obj[n] end)
+		for i = 1, szObjs do
+			writer:WriteFloat32LE(reader(objs[i], name) or 0)
+		end
+		return writer:ToBuffer()
+	end,
+	["double"] = function(objs, name, func)
+		local szObjs = #objs
+		local writer = BinaryWriter.new(8 * szObjs)
+		local reader = func or (function(obj, n) return obj[n] end)
+		for i = 1, szObjs do
+			writer:WriteFloat64LE(reader(objs[i], name) or 0)
+		end
+		return writer:ToBuffer()
+	end,
+	["UDim"] = function(objs, name, func)
+		local szObjs = #objs
+		local writer = BinaryWriter.new(8 * szObjs)
+		local reader = func or (function(obj, n) return obj[n] end)
+		for i = 1, szObjs do
+			local val = reader(objs[i], name) or UDim.new()
+			writer:WriteFloat32LE(val.Scale)
+			writer:WriteInt32LE(val.Offset)
+		end
+		return writer:ToBuffer()
+	end,
+	["UDim2"] = function(objs, name, func)
+		local szObjs = #objs
+		local writer = BinaryWriter.new(16 * szObjs)
+		local reader = func or (function(obj, n) return obj[n] end)
+		for i = 1, szObjs do
+			local val = reader(objs[i], name) or UDim2.new()
+			writer:WriteFloat32LE(val.X.Scale)
+			writer:WriteInt32LE(val.X.Offset)
+			writer:WriteFloat32LE(val.Y.Scale)
+			writer:WriteInt32LE(val.Y.Offset)
+		end
+		return writer:ToBuffer()
+	end,
+	["Vector2"] = function(objs, name, func)
+		local szObjs = #objs
+		local writer = BinaryWriter.new(8 * szObjs)
+		local reader = func or (function(obj, n) return obj[n] end)
+		for i = 1, szObjs do
+			local val = reader(objs[i], name) or Vector2.new()
+			writer:WriteFloat32LE(val.X)
+			writer:WriteFloat32LE(val.Y)
+		end
+		return writer:ToBuffer()
+	end,
+	["Vector3"] = function(objs, name, func)
+		local szObjs = #objs
+		local writer = BinaryWriter.new(12 * szObjs)
+		local reader = func or (function(obj, n) return obj[n] end)
+		for i = 1, szObjs do
+			local val = reader(objs[i], name) or Vector3.new()
+			writer:WriteFloat32LE(val.X)
+			writer:WriteFloat32LE(val.Y)
+			writer:WriteFloat32LE(val.Z)
+		end
+		return writer:ToBuffer()
+	end,
+	["Color3"] = function(objs, name, func)
+		local szObjs = #objs
+		local writer = BinaryWriter.new(12 * szObjs)
+		local reader = func or (function(obj, n) return obj[n] end)
+		for i = 1, szObjs do
+			local val = reader(objs[i], name) or Color3.new()
+			writer:WriteFloat32LE(val.R)
+			writer:WriteFloat32LE(val.G)
+			writer:WriteFloat32LE(val.B)
+		end
+		return writer:ToBuffer()
+	end,
+	["CFrame"] = function(objs, name, func)
+		local szObjs = #objs
+		local writer = BinaryWriter.new(49 * szObjs)
+		local reader = func or (function(obj, n) return obj[n] end)
+		local tempBuf = buffer.create(36)
+		
+		for i = 1, szObjs do
+			local val = reader(objs[i], name) or CFrame.new()
+			local _, _, _, R00, R01, R02, R10, R11, R12, R20, R21, R22 = val:GetComponents()
+			
+			buffer.writef32(tempBuf, 0, R00)
+			buffer.writef32(tempBuf, 4, R01)
+			buffer.writef32(tempBuf, 8, R02)
+			buffer.writef32(tempBuf, 12, R10)
+			buffer.writef32(tempBuf, 16, R11)
+			buffer.writef32(tempBuf, 20, R12)
+			buffer.writef32(tempBuf, 24, R20)
+			buffer.writef32(tempBuf, 28, R21)
+			buffer.writef32(tempBuf, 32, R22)
+			
+			local strKey = buffer.tostring(tempBuf)
+			local mappedID = binaryCFrameMap[strKey]
+			
+			if mappedID then
+				writer:WriteString(mappedID)
+			else
+				writer:WriteUInt8(0)
+				writer:WriteString(strKey)
+			end
+			
+			writer:WriteFloat32LE(val.Position.X)
+			writer:WriteFloat32LE(val.Position.Y)
+			writer:WriteFloat32LE(val.Position.Z)
+		end
+		return writer:ToBuffer()
+	end,
+	["Enum"] = function(objs, name, func)
+		local szObjs = #objs
+		local writer = BinaryWriter.new(4 * szObjs)
+		local reader = func or (function(obj, n) return obj[n] end)
+		for i = 1, szObjs do
+			local val = reader(objs[i], name)
+			writer:WriteInt32LE(val and val.Value or 0)
+		end
+		return writer:ToBuffer()
+	end,
+	["Referent"] = function(objs, name, func)
+		local szObjs = #objs
+		local writer = BinaryWriter.new(4 * szObjs)
+		local reader = func or (function(obj, n) return obj[n] end)
+		for i = 1, szObjs do
+			local val = reader(objs[i], name)
+			writer:WriteInt32LE(val and getRef(val) or -1)
+		end
+		return writer:ToBuffer()
+	end,
+	["BrickColor"] = function(objs, name, func)
+		local szObjs = #objs
+		local writer = BinaryWriter.new(4 * szObjs)
+		local reader = func or (function(obj, n) return obj[n] end)
+		for i = 1, szObjs do
+			local val = reader(objs[i], name)
+			writer:WriteInt32LE(val and val.Number or 0)
+		end
+		return writer:ToBuffer()
+	end,
+}
+
+-- ============================================================================
+-- BINARY SAVE FUNCTION
+-- ============================================================================
+
+local function saveBinary(root, filename, options)
+	local isGame = root == game
+	local isTable = type(root) == "table"
+	if isTable and not root[1] then error("Empty Table") end
+	
+	if not filename or filename == "" then
+		local PlaceId = game.PlaceId
+		local PlaceName = "Place"
+		pcall(function()
+			local info = service.MarketplaceService:GetProductInfoAsync(PlaceId)
+			if info and info.Name then
+				PlaceName = string.gsub(info.Name, "[^%w%s-]", "")
+				PlaceName = string.gsub(PlaceName, "%s+", "_")
+			end
+		end)
+		local ext = options.IsModel and ".rbxm" or ".rbxl"
+		filename = string.format("%s_%d_%s%s", PlaceName, PlaceId, os.date("%Y-%m-%d_%H-%M-%S"), ext)
+	end
+	
+	if options.AvoidFileOverwrite and isfile then
+		local base, ext = filename:match("^(.-)(%.[^%.]+)$")
+		base = base or filename
+		ext = ext or ""
+		local counter = 1
+		while isfile(filename) do
+			filename = base .. " (" .. counter .. ")" .. ext
+			counter += 1
+		end
+	end
+	
+	-- Build binary data
+	local instBuf = {}
+	local propBuf = {}
+	local prntBuf = {}
+	local sstrBuf = {}
+	
+	local classList = {}
+	local refs = {}
+	local parents = {}
+	local orderedInstList = {}
+	local instCount = 0
+	local instTypeCount = 0
+	local refCount = 0
+	local sharedStrings = {}
+	local sharedStringCount = 0
+	local hashs = {}
+	
+	local folderClasses = {["Player"] = true, ["PlayerScripts"] = true, ["PlayerGui"] = true}
+	local filter = {}
+	
+	if isGame then
+		for i,v in service.Players:GetPlayers() do
+			if not options.SavePlayers then filter[v] = true end
+			if options.RemovePlayerCharacters and v.Character then filter[v.Character] = true end
+		end
+	end
+	
+	local function recur(obj)
+		if filter[obj] then return end
+		
+		local class = obj.ClassName
+		if folderClasses[class] then class = "Folder" end
+		
+		local cList = classList[class]
+		if not cList then cList = {} classList[class] = cList instTypeCount += 1 end
+		
+		instCount += 1
+		orderedInstList[instCount] = obj
+		cList[#cList + 1] = obj
+		refs[obj] = refCount
+		refCount += 1
+		
+		for _, child in obj:GetChildren() do
+			parents[child] = obj
+			recur(child)
+		end
+	end
+	
+	if isGame then
+		for _, obj in game:GetChildren() do
+			if obj.ClassName ~= "CoreGui" and obj.ClassName ~= "CorePackages" then
+				recur(obj)
+			end
+		end
+	elseif isTable then
+		for _, obj in root do recur(obj) end
+	else
+		recur(root)
+	end
+	
+	-- Build INST chunks
+	local typeId = 0
+	for class, objs in classList do
+		local numObjs = #objs
+		local writer = BinaryWriter.new()
+		writer:WriteString(class)
+		writer:WriteUInt8(0) -- Not service
+		writer:WriteUInt32LE(numObjs)
+		
+		local lastRef
+		for i = 1, numObjs do
+			local ref = refs[objs[i]]
+			local accRef = lastRef and (ref - lastRef) or ref
+			lastRef = ref
+			local transformed = accRef < 0 and (2 * -accRef - 1) or (2 * accRef)
+			writer:WriteUInt32LE(transformed)
+		end
+		
+		instBuf[#instBuf + 1] = CreateChunk("INST", writer:ToBuffer())
+		typeId += 1
+	end
+	
+	-- Build PROP chunks
+	typeId = 0
+	for class, objs in classList do
+		local numObjs = #objs
+		local props = GetInheritedProps(class)
+		
+		for _, prop in props do
+			local propName = prop.Name
+			local valueType = prop.ValueType
+			local category = prop.Category
+			
+			local handler
+			local typeByte
+			
+			if category == "Class" then
+				handler = binaryPropHandlers.Referent
+				typeByte = binaryDataTypes.Referent
+			elseif category == "Enum" then
+				handler = binaryPropHandlers.Enum
+				typeByte = binaryDataTypes.Enum
+			else
+				handler = binaryPropHandlers[valueType]
+				typeByte = binaryDataTypes[valueType]
+			end
+			
+			if handler and typeByte then
+				local data = handler(objs, propName)
+				if data and #data > 0 then
+					local writer = BinaryWriter.new()
+					writer:WriteString(propName)
+					writer:WriteString(typeByte)
+					writer:WriteString(data)
+					propBuf[#propBuf + 1] = CreateChunk("PROP", writer:ToBuffer())
+				end
+			end
+		end
+		typeId += 1
+	end
+	
+	-- Build PRNT chunk
+	local writer = BinaryWriter.new(5 + 8 * instCount)
+	writer:WriteUInt8(0)
+	writer:WriteUInt32LE(instCount)
+	
+	local lastObjRef, lastParRef
+	for i = 1, instCount do
+		local obj = orderedInstList[i]
+		local ref = refs[obj]
+		local parRef = refs[parents[obj]] or -1
+		
+		local accObjRef = lastObjRef and (ref - lastObjRef) or ref
+		lastObjRef = ref
+		local accParRef = lastParRef and (parRef - lastParRef) or parRef
+		lastParRef = parRef
+		
+		writer:WriteUInt32LE(accObjRef < 0 and (2 * -accObjRef - 1) or (2 * accObjRef))
+		writer:WriteUInt32LE(accParRef < 0 and (2 * -accParRef - 1) or (2 * accParRef))
+	end
+	
+	prntBuf[1] = CreateChunk("PRNT", writer:ToBuffer())
+	
+	-- Build header
+	local headerWriter = BinaryWriter.new(32)
+	headerWriter:WriteString("<roblox!\137\255\13\10\26\10\0\0")
+	headerWriter:WriteInt32LE(instTypeCount)
+	headerWriter:WriteInt32LE(instCount)
+	headerWriter:WriteUInt32LE(0)
+	headerWriter:WriteUInt32LE(0)
+	
+	local metaData = "\77\69\84\65\36\0\0\0\34\0\0\0\0\0\0\0\240\19\1\0\0\0\18\0\0\0\69\120\112\108\105\99\105\116\65\117\116\111\74\111\105\110\116\115\4\0\0\0\116\114\117\101"
+	local endData = "\69\78\68\0\0\0\0\0\9\0\0\0\0\0\0\0\60\47\114\111\98\108\111\120\62"
+	
+	-- Build final buffer
+	local finalChunks = {headerWriter:ToBuffer(), metaData}
+	for _, chunk in instBuf do finalChunks[#finalChunks + 1] = chunk end
+	for _, chunk in propBuf do finalChunks[#finalChunks + 1] = chunk end
+	for _, chunk in prntBuf do finalChunks[#finalChunks + 1] = chunk end
+	finalChunks[#finalChunks + 1] = endData
+	
+	local finalData = table.concat(finalChunks)
+	
+	if options.Clipboard and setrbxclipboard then
+		setrbxclipboard(finalData)
+		return true, "Copied to clipboard"
+	end
+	
+	if options.Callback then
+		options.Callback(finalData)
+		return true, "Callback executed"
+	end
+	
+	if writefile then
+		writefile(filename, finalData)
+		return true, "Saved to " .. filename
+	end
+	
+	return false, "No output method available"
+end
+
+-- ============================================================================
+-- MODIFIED: classifyTable and resolveTypeName moved earlier for binary support
+-- ============================================================================
 
 local Binary_Encoders
 Binary_Encoders = {
@@ -3077,7 +3628,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 			RemovePlayerCharacters = "SavePlayerCharacters",
 		},
 		
-		-- NEW OPTIONS FROM DEXRE
+		-- NEW OPTIONS
 		Binary = false,
 		Clipboard = false,
 		MaxThreads = 3,
@@ -3207,10 +3758,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 		end
 	end
 
-	-- ============================================================
 	-- Apply DexRE features after OPTIONS merging
-	-- ============================================================
-	
 	if OPTIONS.Anonymous then
 		CleanAnonymousData(ToSaveInstance or game, OPTIONS)
 	end
@@ -3691,19 +4239,14 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 		end
 	end
 
-	-- ============================================================
-	-- NEW: Use Parallel Decompilation with Thread Pool
-	-- ============================================================
-	
+	-- Use parallel decompilation with fallback
 	do
 		if not OPTIONS.Decompile then
 			ldecompile = function(script)
 				return "-- Decompiling is disabled"
 			end
 		else
-			-- Use the parallel decompiler with fallback
 			ldecompile = function(script)
-				-- For single script, use fallback directly
 				return DecompileWithFallback(script, OPTIONS)
 			end
 		end
@@ -3950,10 +4493,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 		return Item
 	end
 
-	-- ============================================================
-	-- MODIFIED: save_hierarchy with parallel decompilation support
-	-- ============================================================
-	
+	-- Modified save_hierarchy with parallel decompilation support
 	local function save_hierarchy(hierarchy)
 		-- Collect all scripts for parallel decompilation
 		local scriptsToDecompile = {}
@@ -4384,6 +4924,20 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 	end
 
 	local function save_game()
+		-- Check if binary format is requested
+		if OPTIONS.Binary then
+			-- Use binary format
+			local filename = placename:gsub("%.rbxlx$", ".rbxl"):gsub("%.rbxmx$", ".rbxm")
+			local success, result = saveBinary(ToSaveInstance or game, filename, OPTIONS)
+			if success then
+				if StatusText then
+					StatusText.Text = "Saved binary: " .. filename
+				end
+			end
+			return success, result
+		end
+		
+		-- Otherwise use XML format (original)
 		do
 			if IsModel then
 				header ..= '<Meta name="ExplicitAutoJoints">true</Meta>'
