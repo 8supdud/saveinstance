@@ -81,7 +81,14 @@ local service = setmetatable({}, {
 local sharedStringId = 1e15
 local sharedStrings = setmetatable({}, {
 	__index = function(self, str)
-		local id = base64encode(tostring(sharedStringId))
+		local id
+		local ok, res = pcall(base64encode, tostring(sharedStringId))
+		if ok and type(res) == "string" then
+			id = res
+		else
+			-- Fallback that can never yield
+			id = string.format("SS%x", sharedStringId)
+		end
 		sharedStringId += 1
 
 		self[str] = id
@@ -4542,21 +4549,31 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 						return buffer.tostring(EncodingService:Base64Encode(buffer.fromstring(raw)))
 					end
 
-					if base64encode and base64encode("\1\0\0\0\1") == "AQAAAAE=" then
-						if rbxcrypt_base64encode then
-							base64encode = benchmark(
-								{ base64encode, rbxcrypt_base64encode, EncodingService_base64encode },
-								test_str
-							)
-						end
-					else
-						base64encode = rbxcrypt_base64encode
+					-- FIX: On some executors (Xeno confirmed), UniversalMethodFinder picks up
+					-- an HTTP-backed function as "base64encode". Calling it inside
+					-- save_hierarchy (from __index) triggers "thread is not yieldable".
+					-- Only accept base64encode candidates that pass a synchronous smoke test.
+					local function safeBase64Check(fn)
+						if type(fn) ~= "function" then return false end
+						local ok, res = pcall(fn, "\1\0\0\0\1")
+						return ok and res == "AQAAAAE="
 					end
 
-					if not base64encode then
-						warn("base64encode not found")
+					local candidates = {}
+					if safeBase64Check(base64encode) then table.insert(candidates, base64encode) end
+					if safeBase64Check(rbxcrypt_base64encode) then table.insert(candidates, rbxcrypt_base64encode) end
+					if safeBase64Check(EncodingService_base64encode) then table.insert(candidates, EncodingService_base64encode) end
+
+					if #candidates == 0 then
+						warn("base64encode not found (all candidates failed smoke test)")
 						Cleanup()
 						return
+					end
+
+					if #candidates == 1 then
+						base64encode = candidates[1]
+					else
+						base64encode = benchmark(candidates, test_str)
 					end
 				end
 			end
