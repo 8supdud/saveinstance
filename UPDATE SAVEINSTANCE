@@ -1344,6 +1344,9 @@ do
 	local NotScriptableFixes = {
 		Instance = {
 			AttributesSerialize = function(instance)
+				if EXECUTOR_NAME == "Madium" then
+					return ""
+				end
 				local attrs = instance:GetAttributes()
 
 				if not next(attrs) then
@@ -4455,6 +4458,9 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 				local UGCValidationService
 
 				gethiddenproperty_fallback = function(instance, propertyName)
+					if EXECUTOR_NAME == "Madium" then
+						return nil
+					end
 					if not UGCValidationService then
 						UGCValidationService = service.UGCValidationService
 					end
