@@ -3437,7 +3437,17 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
 			end
 		else
 			if CanRead then
-				raw = instance[propertyName]
+				local ok, result = pcall(function() return instance[propertyName] end)
+				if ok then
+					raw = result
+				else
+					warn(string.format(
+						"[SaveInstance] Skipped %s [%s].%s: %s",
+						instance:GetFullName(), instance.ClassName,
+						tostring(propertyName), tostring(result)
+					))
+					return __BREAK
+				end
 			else
 				local ok, result = pcall(index, instance, propertyName)
 
